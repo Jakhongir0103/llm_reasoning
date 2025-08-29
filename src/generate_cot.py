@@ -157,8 +157,8 @@ if __name__ == "__main__":
         )
 
     # select a subset of the dataset for analysis
-    if len(prompts) > 500:
-        prompts = random.sample(prompts, 500)
+    if len(prompts) > 200:
+        prompts = random.sample(prompts, 200)
 
     model, tokenizer = load_model(model_name=args.model_name)
 

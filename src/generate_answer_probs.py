@@ -1,3 +1,4 @@
+import random
 import argparse
 import pickle
 from pathlib import Path
@@ -134,6 +135,9 @@ if __name__ == "__main__":
     with open(save_dir / "cots.pkl", "rb") as f:
         cot_data = pickle.load(f)
 
+    if len(cot_data) > 200:
+        cot_data = random.sample(cot_data, 200)
+
     model, tokenizer = load_model(model_name=args.model_name)
 
     # COT generation
@@ -153,10 +157,10 @@ if __name__ == "__main__":
         answer_indices = find_sublist_indices(item['input_and_cot_ids'], answer_ids)
 
         target_outputs = {
-            'with_eot': f"\n</think>\n\n\boxed{{{item['answer']}}}",
-            'with_eot_conditioned': f"\n</think>\n\n\boxed{{{item['answer']}}}", # [6:]
-            'without_eot': f"\boxed{{{item['answer']}}}",
-            'without_eot_conditioned': f"\boxed{{{item['answer']}}}", # [3:]
+            'with_eot': f"\n</think>\n\n\\boxed{{{item['answer']}}}",
+            'with_eot_conditioned': f"\n</think>\n\n\\boxed{{{item['answer']}}}", # [6:]
+            'without_eot': f"\\boxed{{{item['answer']}}}",
+            'without_eot_conditioned': f"\\boxed{{{item['answer']}}}", # [3:]
             'without_eot_nor_boxed': item['answer']
         }
 
