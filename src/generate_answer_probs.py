@@ -194,9 +194,9 @@ if __name__ == "__main__":
                     # Joint log probability
                     log_probs = torch.log_softmax(logits_for_targets, dim=-1)
                     token_log_probs = log_probs[0, torch.arange(len(target_output_ids)), target_output_ids]
-                    if target_output_method == 'with_eot_fixed_cond':
+                    if target_output_method == 'with_eot_conditioned':
                         joint_log_prob = token_log_probs[6:].sum().item()  
-                    elif target_output_method == 'without_eot_fixed_cond':
+                    elif target_output_method == 'without_eot_conditioned':
                         joint_log_prob = token_log_probs[3:].sum().item()
                     else:
                         joint_log_prob = token_log_probs.sum().item()

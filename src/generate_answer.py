@@ -1,4 +1,3 @@
-import re
 import random
 import argparse
 import pickle
@@ -7,6 +6,7 @@ from tqdm import tqdm
 
 import numpy as np
 
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 def load_model(model_name: str):
@@ -175,7 +175,8 @@ if __name__ == "__main__":
             continue
 
         chunk_methods = {}
-        for method in ['keywords', 'eot_threshold', 'uniform', 'newlines']:
+        # for method in ['keywords', 'eot_threshold', 'uniform', 'newlines']:
+        for method in ['keywords', 'eot_threshold']:
             chunk_end_ids, chunks_cumulative = chunk_cot(
                 input_and_cot_tokens=item['input_and_cot_tokens'],
                 input_and_cot_ids=item['input_and_cot_ids'],
@@ -185,7 +186,7 @@ if __name__ == "__main__":
             )
 
 
-            batch_size = 8  # adjust depending on GPU memory
+            batch_size = 2  # adjust depending on GPU memory
             num_return_sequences = 3
             chunk_outputs = []
 
@@ -205,11 +206,12 @@ if __name__ == "__main__":
                 ).to(model.device)
 
                 # Generate `num_return_sequences` answers per input in the batch
-                outputs = model.generate(
-                    **batch_inputs,
-                    max_new_tokens=4096,
-                    num_return_sequences=num_return_sequences,
-                )
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **batch_inputs,
+                        max_new_tokens=4096,
+                        num_return_sequences=num_return_sequences,
+                    )
 
                 # Split outputs: since num_return_sequences > 1, HuggingFace arranges them in order
                 # Example: [x1..xn, y1..yn, z1..zn, ...]
@@ -222,7 +224,11 @@ if __name__ == "__main__":
                     tokenizer.bos_token_id,
                 }
 
-                for j, (chunk_end_id, inp_ids) in enumerate(zip(batch_chunk_end_ids, batch_inputs["input_ids"])):
+                batch_inputs_cpu = batch_inputs["input_ids"].cpu()  # store only IDs on CPU
+                del batch_inputs
+                torch.cuda.empty_cache()
+
+                for j, (chunk_end_id, inp_ids) in enumerate(zip(batch_chunk_end_ids, batch_inputs_cpu)):
                     generated = outputs_per_input[j, :, inp_ids.shape[0]:]  # strip prompt length
                     decoded_outputs = tokenizer.batch_decode(generated)
                     decoded_answers = [extract_boxed_solution(output) for output in decoded_outputs]
@@ -237,6 +243,11 @@ if __name__ == "__main__":
                     )
 
             chunk_methods[method] = chunk_outputs
+
+            # clear GPU
+            del outputs, generated, outputs_per_input
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
         data_output.append(
             {

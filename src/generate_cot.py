@@ -12,7 +12,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 dataset_paths = {
     'aime': '/scratch/saydalie/llm_reasoning/data/aime_1983_2023/train.jsonl',
     'gsm8k': '/scratch/saydalie/llm_reasoning/data/gsm8k/train.jsonl',
-    'math': '/scratch/saydalie/llm_reasoning/data/math/train.jsonl'
+    'math': '/scratch/saydalie/llm_reasoning/data/math/train.jsonl',
+    'hotpotqa': '/scratch/saydalie/llm_reasoning/data/hotpotqa/train.jsonl'
 }
 
 def load_model(model_name: str):
@@ -106,7 +107,7 @@ def generate_cot(prompt, tokenizer, model, max_new_tokens=32768):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen3-8B', choices=['deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B', 'Qwen/Qwen3-8B'])
-    parser.add_argument('--dataset', type=str, required=True, choices=['aime', 'gsm8k', 'math'])
+    parser.add_argument('--dataset', type=str, required=True, choices=['aime', 'gsm8k', 'math', 'hotpotqa'])
     parser.add_argument('--subject', type=str, required=False, choices=['Algebra', 'Prealgebra'], help='Required if `dataset==math`')
     parser.add_argument('--level', type=int, required=False, choices=[1, 2, 3, 4, 5], help='Required if `dataset==math`')
     parser.add_argument('--output_dir', type=str, default='/scratch/saydalie/llm_reasoning/data/outputs/')
@@ -145,6 +146,11 @@ if __name__ == "__main__":
             id = item['unique_id']
             question = item['problem']
             answer = item['answer']
+        elif args.dataset == 'hotpotqa':
+            id = item['id']
+            question = f"{item['context']}\n\nGiven the above context, answer the following question: {item['question']}"
+            answer = item['answer']
+            # columns not used: type, level
         else:
             raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -175,8 +181,6 @@ if __name__ == "__main__":
             model=model, 
             max_new_tokens=32768
         )
-
-        print(len(input_and_cot_tokens), len(input_and_cot_ids), len(cot_entropies), len(cot_eot_probs), input_len)
 
         outputs.append(
             {
