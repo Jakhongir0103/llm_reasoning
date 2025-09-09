@@ -36,19 +36,19 @@ def extract_solution_gsm8k(text: str) -> str:
     marker = "\n####"
     return text.split(marker, 1)[1].strip()
 
-def generate_cot(prompt, tokenizer, model, max_new_tokens=32768):
+
+def generate_cot(prompt, tokenizer, model, max_new_tokens=32768, top_k=20):
     """
     Returns:
         - Prompt+CoT tokens
         - Prompt+CoT token-ids
-        - CoT token-level entropies
-        - CoT token-level </think> probabilities
-        - CoT token-level </think> log-probabilities
+        - CoT token-level *top-k* probs        (list[list[float]], k each step)
+        - CoT token-level *top-k* log-probs    (list[list[float]], k each step)
+        - CoT token-level entropies            (float per step; exact)
+        - CoT token-level </think> probabilities (float per step; exact)
         - prompt length
     """
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
+    messages = [{"role": "user", "content": prompt}]
     inputs = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -58,7 +58,15 @@ def generate_cot(prompt, tokenizer, model, max_new_tokens=32768):
         enable_thinking=True
     ).to(model.device)
 
-    # Generate output with logits
+    # Try to resolve the </think> token id dynamically, fall back to Qwen3 id.
+    try:
+        eot_id = tokenizer.convert_tokens_to_ids("</think>")
+        if eot_id is None or eot_id < 0:
+            eot_id = 151668
+    except Exception:
+        eot_id = 151668  # Qwen/Qwen3-8B
+    # NOTE: DeepSeek-R1-Distill-Qwen-1.5B uses 151649 for </think>.
+
     output = model.generate(
         **inputs,
         tokenizer=tokenizer,
@@ -73,50 +81,146 @@ def generate_cot(prompt, tokenizer, model, max_new_tokens=32768):
         min_p=0
     )
 
-    # Get the prompt length
     input_and_output_ids = output.sequences
     input_len = inputs['input_ids'].shape[1]
 
-    # Compute the entropy and </think> probability at for each token (assumes batch size = 1)
-    output_probs     = []
-    output_log_probs = []
-    output_entropies = []
-    output_eot_probs = []
-    for logits in output.logits:
-        probs = F.softmax(logits, dim=-1)           # [batch_size, vocab_size]
-        output_probs.append(probs)
-        log_probs = F.log_softmax(logits, dim=-1)   # [batch_size, vocab_size]
-        output_log_probs.append(log_probs)
-        entropy = -(probs * log_probs).sum(dim=-1)  # [batch_size]
-        output_entropies.append(entropy.item())
+    # We'll keep only top-k for probs/log-probs
+    output_topk_probs: list[list[float]] = []
+    output_topk_log_probs: list[list[float]] = []
+    output_entropies: list[float] = []
+    output_eot_probs: list[float] = []
 
-        # </think> token's (log)probability
-        output_eot_prob = probs[:, 151668]          # [batch_size]
-        output_eot_probs.append(output_eot_prob.item())
+    for logits in output.logits:  # logits shape: [1, vocab]
+        # logsumexp denominator for exact probabilities
+        denom = torch.logsumexp(logits, dim=-1)  # [1]
 
-    # Flatten tensors
+        # Top-k by logit (works better than top-k on probs)
+        topk_vals, topk_idx = torch.topk(logits, k=min(top_k, logits.shape[-1]), dim=-1)  # [1, k]
+        # Exact top-k log-probs / probs w.r.t. full distribution
+        topk_log_probs = (topk_vals - denom.unsqueeze(-1)).squeeze(0)  # [k]
+        topk_probs = torch.exp(topk_log_probs)                          # [k]
+
+        # Store as plain Python lists on CPU (small, pickle-friendly)
+        output_topk_log_probs.append(topk_log_probs.detach().cpu().tolist())
+        output_topk_probs.append(topk_probs.detach().cpu().tolist())
+
+        # Exact entropy (computed from full distribution, not stored)
+        log_probs_full = F.log_softmax(logits, dim=-1)
+        probs_full = log_probs_full.exp()
+        entropy = -(probs_full * log_probs_full).sum(dim=-1)  # [1]
+        output_entropies.append(float(entropy.item()))
+
+        # Exact prob of </think>
+        eot_log_prob = (logits[0, eot_id] - denom[0])
+        output_eot_probs.append(float(torch.exp(eot_log_prob).item()))
+
+    # Flatten token ids
     input_and_output_token_ids = input_and_output_ids[0].tolist()
 
-    # parsing thinking content
+    # Find end of </think> if present and slice everything to that point
     try:
-        # rindex finding 151668 (</think>) --  corresponds to position index of </think> + 1
-        end_of_think_id = len(input_and_output_token_ids) - input_and_output_token_ids[::-1].index(151668)
+        end_of_think_id = len(input_and_output_token_ids) - input_and_output_token_ids[::-1].index(eot_id)
         input_and_cot_ids = input_and_output_token_ids[:end_of_think_id]
-        cot_probs     = output_probs[:end_of_think_id-input_len]
-        cot_log_probs = output_log_probs[:end_of_think_id-input_len]
-        cot_entropies = output_entropies[:end_of_think_id-input_len]
-        cot_eot_probs = output_eot_probs[:end_of_think_id-input_len]
+        cot_probs       = output_topk_probs[:end_of_think_id - input_len]
+        cot_log_probs   = output_topk_log_probs[:end_of_think_id - input_len]
+        cot_entropies   = output_entropies[:end_of_think_id - input_len]
+        cot_eot_probs   = output_eot_probs[:end_of_think_id - input_len]
     except ValueError:
+        # No </think> found; keep all
         input_and_cot_ids = input_and_output_token_ids
-        cot_probs     = output_probs
-        cot_log_probs = output_log_probs
-        cot_entropies = output_entropies
-        cot_eot_probs = output_eot_probs
+        cot_probs       = output_topk_probs
+        cot_log_probs   = output_topk_log_probs
+        cot_entropies   = output_entropies
+        cot_eot_probs   = output_eot_probs
 
     # Detokenize each token individually
-    input_and_cot_tokens = [tokenizer.decode([tid], skip_special_tokens=False) for tid in input_and_cot_ids]
+    input_and_cot_tokens = [tokenizer.decode([tid], skip_special_tokens=False)
+                            for tid in input_and_cot_ids]
 
-    return input_and_cot_tokens, input_and_cot_ids, cot_probs, cot_log_probs, cot_entropies, cot_eot_probs, input_len
+    return (input_and_cot_tokens, input_and_cot_ids,
+            cot_probs, cot_log_probs, cot_entropies, cot_eot_probs, input_len)
+
+#def generate_cot(prompt, tokenizer, model, max_new_tokens=32768):
+#    """
+#    Returns:
+#        - Prompt+CoT tokens
+#        - Prompt+CoT token-ids
+#        - CoT token-level entropies
+#        - CoT token-level </think> probabilities
+#        - CoT token-level </think> log-probabilities
+#        - prompt length
+#    """
+#    messages = [
+#        {"role": "user", "content": prompt}
+#    ]
+#    inputs = tokenizer.apply_chat_template(
+#        messages,
+#        add_generation_prompt=True,
+#        tokenize=True,
+#        return_dict=True,
+#        return_tensors="pt",
+#        enable_thinking=True
+#    ).to(model.device)
+#
+#    # Generate output with logits
+#    output = model.generate(
+#        **inputs,
+#        tokenizer=tokenizer,
+#        max_new_tokens=max_new_tokens,
+#        return_dict_in_generate=True,
+#        output_logits=True,
+#        stop_strings='</think>',
+#        # NOTE: the below parameters are recommended for Qwen3-8B: https://huggingface.co/Qwen/Qwen3-8B
+#        temperature=0.6,
+#        top_p=0.95,
+#        top_k=20,
+#        min_p=0
+#    )
+#
+#    # Get the prompt length
+#    input_and_output_ids = output.sequences
+#    input_len = inputs['input_ids'].shape[1]
+#
+#    # Compute the entropy and </think> probability at for each token (assumes batch size = 1)
+#    output_probs     = []
+#    output_log_probs = []
+#    output_entropies = []
+#    output_eot_probs = []
+#    for logits in output.logits:
+#        probs = F.softmax(logits, dim=-1)           # [batch_size, vocab_size]
+#        output_probs.append(probs.detach().cpu())
+#        log_probs = F.log_softmax(logits, dim=-1)   # [batch_size, vocab_size]
+#        output_log_probs.append(log_probs.detach().cpu())
+#        entropy = -(probs * log_probs).sum(dim=-1)  # [batch_size]
+#        output_entropies.append(entropy.item())
+#
+#        # </think> token's (log)probability
+#        output_eot_prob = probs[:, 151668]          # [batch_size]
+#        output_eot_probs.append(output_eot_prob.item())
+#
+#    # Flatten tensors
+#    input_and_output_token_ids = input_and_output_ids[0].tolist()
+#
+#    # parsing thinking content
+#    try:
+#        # rindex finding 151668 (</think>) --  corresponds to position index of </think> + 1
+#        end_of_think_id = len(input_and_output_token_ids) - input_and_output_token_ids[::-1].index(151668)
+#        input_and_cot_ids = input_and_output_token_ids[:end_of_think_id]
+#        cot_probs     = output_probs[:end_of_think_id-input_len]
+#        cot_log_probs = output_log_probs[:end_of_think_id-input_len]
+#        cot_entropies = output_entropies[:end_of_think_id-input_len]
+#        cot_eot_probs = output_eot_probs[:end_of_think_id-input_len]
+#    except ValueError:
+#        input_and_cot_ids = input_and_output_token_ids
+#        cot_probs     = output_probs
+#        cot_log_probs = output_log_probs
+#        cot_entropies = output_entropies
+#        cot_eot_probs = output_eot_probs
+#
+#    # Detokenize each token individually
+#    input_and_cot_tokens = [tokenizer.decode([tid], skip_special_tokens=False) for tid in input_and_cot_ids]
+#
+#    return input_and_cot_tokens, input_and_cot_ids, cot_probs, cot_log_probs, cot_entropies, cot_eot_probs, input_len
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
