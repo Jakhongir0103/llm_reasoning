@@ -119,9 +119,15 @@ def train_one_epoch(
             # Also collect entropy for regularization
             logp_sum = 0.0
             H_sum = 0.0
+            num_decisions = 0
             for lp, ent in zip(comp_out.log_probs, comp_out.entropies):
                 logp_sum = logp_sum + lp.sum()
                 H_sum = H_sum + ent.sum()
+                num_decisions += lp.numel()
+
+            if num_decisions > 0:
+                logp_sum = logp_sum / num_decisions  # normalize PG term per decision
+                H_sum = H_sum / num_decisions        # entropy per decision
             entropies_total.append(H_sum)
 
             # REINFORCE policy gradient

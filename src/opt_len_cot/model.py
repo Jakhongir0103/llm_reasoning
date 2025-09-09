@@ -191,92 +191,80 @@ class PromptCompressionWrapper(nn.Module):
         question_text: str,
         sample: bool = False,
         threshold: float = 0.5,
-        temperature: float = 1.0,  # for possible future use; not used directly here
+        temperature: float = 1.0,
     ) -> CompressionOutput:
         """
-        Compresses PROMPT ONLY while allowing compressor to read [prompt || SEP || question].
-        Returns decoded 'kept_text' (for prompt only) and training stats if sample=True.
+        Always condition compression on the question:
+          For each prompt chunk, build: [BOS] chunk_prompt [SEP] [SEP] question [SEP]
+        Only prompt tokens are eligible for dropping; question tokens are force-kept.
         """
         device = self.device
-        # Tokenize prompt and question separately to know boundaries
-        ptoks = self.comp_tok(prompt_text, add_special_tokens=True)
-        qtoks = self.comp_tok(question_text, add_special_tokens=True)
+        tok = self.comp_tok
 
-        prompt_ids = ptoks["input_ids"]
-        question_ids = qtoks["input_ids"]
+        # Raw IDs (no specials) so we can build our own layout
+        prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
+        q_ids_full = tok(question_text, add_special_tokens=False)["input_ids"]
 
-        # Compose joint input: [prompt_ids (w/ specials)] + [sep] + [question_ids (w/ specials)]
-        sep_id = self.comp_tok.sep_token_id or self.comp_tok.eos_token_id
-        if sep_id is None:
-            # create a SEP token if truly absent
-            sep_id = self.comp_tok.convert_tokens_to_ids("<SEP>")
+        # Special tokens (RoBERTa/XL-M-R style)
+        bos_id = tok.bos_token_id or tok.cls_token_id
+        sep_id = tok.sep_token_id or tok.eos_token_id
+        special_ids = set([x for x in [bos_id, sep_id, tok.pad_token_id, tok.eos_token_id, tok.cls_token_id] if x is not None])
 
-        joint_ids = prompt_ids + [sep_id] + question_ids
-        # We'll only allow dropping among indices that belong to 'prompt_ids' (excluding its specials if you want).
-        # For simplicity, we allow the head to score ALL tokens but we force-keep the question span.
-
-        # Chunk by compressor max length
+        # Budgeting: for RoBERTa pair format we have roughly:
+        # <s> A </s> </s> B </s>  ==> overhead = 1 BOS + 3 SEP = 4 tokens (if sep_id exists)
+        overhead = (1 if bos_id is not None else 0) + (3 if sep_id is not None else 0)
         max_len = self.compressor.max_length
-        chunks = self._split_into_chunks(joint_ids, max_len=max_len)
+
+        # Ensure per-chunk room for at least 1 prompt token; truncate question if necessary
+        q_ids = list(q_ids_full)
+        max_prompt_per_chunk = max_len - overhead - len(q_ids)
+        if max_prompt_per_chunk < 1:
+            # Truncate question to leave space for at least 1 prompt token
+            q_keep = max(0, max_len - overhead - 1)
+            q_ids = q_ids[:q_keep]
+            max_prompt_per_chunk = max_len - overhead - len(q_ids)
+            # If still no room, we’ll proceed with empty prompt chunks (edge case with huge question)
+
+        # Chunk ONLY the prompt
+        if len(prompt_ids) == 0:
+            prompt_chunks = [[]]
+        else:
+            prompt_chunks = [prompt_ids[i:i + max(1, max_prompt_per_chunk)]
+                             for i in range(0, len(prompt_ids), max(1, max_prompt_per_chunk))]
 
         kept_text_parts: List[str] = []
         keep_probs_list, actions_list, log_probs_list, entropies_list = [], [], [], []
-
         total_prompt_tokens = 0
         total_kept_prompt_tokens = 0
 
-        # Identify special ids for force-keep: cls/eos/bos/pad/sep if present
-        special_ids = set([
-            tid for tid in [
-                self.comp_tok.cls_token_id,
-                self.comp_tok.bos_token_id,
-                self.comp_tok.eos_token_id,
-                self.comp_tok.pad_token_id,
-                self.comp_tok.sep_token_id,
-            ] if tid is not None
-        ])
+        for chunk in prompt_chunks:
+            # Manually build: <s> chunk </s> </s> question </s>
+            ids = []
+            if bos_id is not None:
+                ids.append(bos_id)
+            prompt_start = len(ids)
+            ids += chunk
+            prompt_len = len(chunk)
+            if sep_id is not None:
+                ids += [sep_id, sep_id]
+            q_start = len(ids)
+            ids += q_ids
+            q_len = len(q_ids)
+            if sep_id is not None:
+                ids += [sep_id]
 
-        # Build offsets to know in which chunk the question span lies.
-        # Simpler approach: rebuild prompt length + sep + question length per chunk.
-        running = 0
-        prompt_total_len = len(prompt_ids)
-        sep_len = 1
-        question_total_len = len(question_ids)
-
-        for chunk_ids in chunks:
-            T = len(chunk_ids)
-            # Determine how much of this chunk belongs to (prompt | sep | question)
-            # Compute span intersections
-            chunk_start = running
-            chunk_end = running + T
-
-            # global spans:
-            prompt_span = (0, prompt_total_len)                  # [0, prompt_total_len)
-            sep_span = (prompt_total_len, prompt_total_len + 1)  # [p, p+1)
-            question_span = (prompt_total_len + 1, prompt_total_len + 1 + question_total_len)
-
-            def span_intersection(a, b):
-                s = max(a[0], b[0]); e = min(a[1], b[1])
-                return (max(0, e - s), s, e) if e > s else (0, s, s)
-
-            prompt_in_chunk_count, ps, pe = span_intersection((chunk_start, chunk_end), prompt_span)
-            sep_in_chunk_count, ss, se = span_intersection((chunk_start, chunk_end), sep_span)
-            q_in_chunk_count, qs, qe = span_intersection((chunk_start, chunk_end), question_span)
-
-            # local indices (relative to chunk)
-            prompt_local_start = ps - chunk_start
-            question_local_start = qs - chunk_start
-
-            # Prepare tensors
-            input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=device)
+            input_ids = torch.tensor([ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
-            # Force keep mask: specials + question span in chunk
-            force_keep = self._force_keep_mask_for_specials_and_question(
-                input_ids, prompt_in_chunk_count, q_in_chunk_count, special_ids
-            )
+            # Force-keep mask: specials + question span
+            force_keep = torch.zeros_like(input_ids, dtype=torch.bool)
+            # specials
+            for sid in special_ids:
+                force_keep |= (input_ids == sid)
+            # question span
+            if q_len > 0:
+                force_keep[:, q_start:q_start + q_len] = True
 
-            # Forward through compressor head
             keep_probs, keep_mask, log_probs, entropies = self.compressor.tokenwise_keep(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -285,44 +273,39 @@ class PromptCompressionWrapper(nn.Module):
                 force_keep_mask=force_keep,
             )
 
-            # Enforce at least one prompt token kept within this chunk (fallback)
-            # Identify prompt-local region in chunk
-            if prompt_in_chunk_count > 0:
+            T = input_ids.shape[1]
+            total_prompt_tokens += prompt_len
+
+            # Ensure at least one prompt token kept in this chunk (fallback)
+            if prompt_len > 0:
                 prompt_region = torch.zeros(T, dtype=torch.bool, device=device)
-                prompt_region[prompt_local_start: prompt_local_start + prompt_in_chunk_count] = True
-                # Are any prompt tokens kept?
+                prompt_region[prompt_start:prompt_start + prompt_len] = True
                 if not (keep_mask & prompt_region).any():
-                    # Keep the top-prob prompt token
                     pr_probs = keep_probs.clone()
-                    pr_probs[~prompt_region] = -1.0  # mask out non-prompt
+                    pr_probs[~prompt_region] = -1.0
                     top_idx = int(torch.argmax(pr_probs).item())
                     keep_mask[top_idx] = True
-
-                total_prompt_tokens += int(prompt_in_chunk_count)
                 total_kept_prompt_tokens += int((keep_mask & prompt_region).sum().item())
 
-            # Decode only kept tokens, but **exclude question** tokens from the returned prompt text
-            # Keep-only ids:
-            kept_ids = [tid for tid, keep in zip(chunk_ids, keep_mask.tolist()) if keep]
-            # Now remove any ids that are part of the question span (local indices)
-            if q_in_chunk_count > 0:
-                q_local_mask = torch.zeros(T, dtype=torch.bool, device=device)
-                q_local_mask[question_local_start: question_local_start + q_in_chunk_count] = True
-                kept_ids = [tid for i, tid in enumerate(chunk_ids) if keep_mask[i].item() and not q_local_mask[i].item()]
-
-            # Decode kept prompt-only tokens:
-            if len(kept_ids) > 0:
-                kept_text_parts.append(self.comp_tok.decode(kept_ids, skip_special_tokens=True))
+            # Decode kept **prompt-only** tokens (exclude question tokens)
+            kept_ids = []
+            for i in range(T):
+                if not keep_mask[i].item():
+                    continue
+                # skip question span
+                if q_len > 0 and (q_start <= i < q_start + q_len):
+                    continue
+                kept_ids.append(int(input_ids[0, i].item()))
+            if kept_ids:
+                kept_text_parts.append(tok.decode(kept_ids, skip_special_tokens=True))
 
             keep_probs_list.append(keep_probs)
             if sample:
-                actions_list.append((keep_mask.to(keep_probs.dtype)))
+                actions_list.append(keep_mask.to(keep_probs.dtype))
                 log_probs_list.append(log_probs)
                 entropies_list.append(entropies)
 
-            running += T
-
-        kept_text = " ".join([s for s in kept_text_parts if s.strip() != ""]).strip()
+        kept_text = " ".join([s for s in kept_text_parts if s.strip()]).strip()
         kept_ratio = (total_kept_prompt_tokens / max(1, total_prompt_tokens)) if total_prompt_tokens > 0 else 1.0
 
         return CompressionOutput(
@@ -335,8 +318,164 @@ class PromptCompressionWrapper(nn.Module):
             meta=dict(
                 total_prompt_tokens=total_prompt_tokens,
                 total_kept_prompt_tokens=total_kept_prompt_tokens,
+                per_chunk_question_len=len(q_ids),
+                overhead_tokens=overhead,
+                compressor_max_len=max_len,
             )
         )
+
+    #def compress_prompt(
+    #    self,
+    #    prompt_text: str,
+    #    question_text: str,
+    #    sample: bool = False,
+    #    threshold: float = 0.5,
+    #    temperature: float = 1.0,  # for possible future use; not used directly here
+    #) -> CompressionOutput:
+    #    """
+    #    Compresses PROMPT ONLY while allowing compressor to read [prompt || SEP || question].
+    #    Returns decoded 'kept_text' (for prompt only) and training stats if sample=True.
+    #    """
+    #    device = self.device
+    #    # Tokenize prompt and question separately to know boundaries
+    #    ptoks = self.comp_tok(prompt_text, add_special_tokens=True)
+    #    qtoks = self.comp_tok(question_text, add_special_tokens=True)
+
+    #    prompt_ids = ptoks["input_ids"]
+    #    question_ids = qtoks["input_ids"]
+
+    #    # Compose joint input: [prompt_ids (w/ specials)] + [sep] + [question_ids (w/ specials)]
+    #    sep_id = self.comp_tok.sep_token_id or self.comp_tok.eos_token_id
+    #    if sep_id is None:
+    #        # create a SEP token if truly absent
+    #        sep_id = self.comp_tok.convert_tokens_to_ids("<SEP>")
+
+    #    joint_ids = prompt_ids + [sep_id] + question_ids
+    #    # We'll only allow dropping among indices that belong to 'prompt_ids' (excluding its specials if you want).
+    #    # For simplicity, we allow the head to score ALL tokens but we force-keep the question span.
+
+    #    # Chunk by compressor max length
+    #    max_len = self.compressor.max_length
+    #    chunks = self._split_into_chunks(joint_ids, max_len=max_len)
+
+    #    kept_text_parts: List[str] = []
+    #    keep_probs_list, actions_list, log_probs_list, entropies_list = [], [], [], []
+
+    #    total_prompt_tokens = 0
+    #    total_kept_prompt_tokens = 0
+
+    #    # Identify special ids for force-keep: cls/eos/bos/pad/sep if present
+    #    special_ids = set([
+    #        tid for tid in [
+    #            self.comp_tok.cls_token_id,
+    #            self.comp_tok.bos_token_id,
+    #            self.comp_tok.eos_token_id,
+    #            self.comp_tok.pad_token_id,
+    #            self.comp_tok.sep_token_id,
+    #        ] if tid is not None
+    #    ])
+
+    #    # Build offsets to know in which chunk the question span lies.
+    #    # Simpler approach: rebuild prompt length + sep + question length per chunk.
+    #    running = 0
+    #    prompt_total_len = len(prompt_ids)
+    #    sep_len = 1
+    #    question_total_len = len(question_ids)
+
+    #    for chunk_ids in chunks:
+    #        T = len(chunk_ids)
+    #        # Determine how much of this chunk belongs to (prompt | sep | question)
+    #        # Compute span intersections
+    #        chunk_start = running
+    #        chunk_end = running + T
+
+    #        # global spans:
+    #        prompt_span = (0, prompt_total_len)                  # [0, prompt_total_len)
+    #        sep_span = (prompt_total_len, prompt_total_len + 1)  # [p, p+1)
+    #        question_span = (prompt_total_len + 1, prompt_total_len + 1 + question_total_len)
+
+    #        def span_intersection(a, b):
+    #            s = max(a[0], b[0]); e = min(a[1], b[1])
+    #            return (max(0, e - s), s, e) if e > s else (0, s, s)
+
+    #        prompt_in_chunk_count, ps, pe = span_intersection((chunk_start, chunk_end), prompt_span)
+    #        sep_in_chunk_count, ss, se = span_intersection((chunk_start, chunk_end), sep_span)
+    #        q_in_chunk_count, qs, qe = span_intersection((chunk_start, chunk_end), question_span)
+
+    #        # local indices (relative to chunk)
+    #        prompt_local_start = ps - chunk_start
+    #        question_local_start = qs - chunk_start
+
+    #        # Prepare tensors
+    #        input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=device)
+    #        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+    #        # Force keep mask: specials + question span in chunk
+    #        force_keep = self._force_keep_mask_for_specials_and_question(
+    #            input_ids, prompt_in_chunk_count, q_in_chunk_count, special_ids
+    #        )
+
+    #        # Forward through compressor head
+    #        keep_probs, keep_mask, log_probs, entropies = self.compressor.tokenwise_keep(
+    #            input_ids=input_ids,
+    #            attention_mask=attention_mask,
+    #            sample=sample,
+    #            threshold=threshold,
+    #            force_keep_mask=force_keep,
+    #        )
+
+    #        # Enforce at least one prompt token kept within this chunk (fallback)
+    #        # Identify prompt-local region in chunk
+    #        if prompt_in_chunk_count > 0:
+    #            prompt_region = torch.zeros(T, dtype=torch.bool, device=device)
+    #            prompt_region[prompt_local_start: prompt_local_start + prompt_in_chunk_count] = True
+    #            # Are any prompt tokens kept?
+    #            if not (keep_mask & prompt_region).any():
+    #                # Keep the top-prob prompt token
+    #                pr_probs = keep_probs.clone()
+    #                pr_probs[~prompt_region] = -1.0  # mask out non-prompt
+    #                top_idx = int(torch.argmax(pr_probs).item())
+    #                keep_mask[top_idx] = True
+
+    #            total_prompt_tokens += int(prompt_in_chunk_count)
+    #            total_kept_prompt_tokens += int((keep_mask & prompt_region).sum().item())
+
+    #        # Decode only kept tokens, but **exclude question** tokens from the returned prompt text
+    #        # Keep-only ids:
+    #        kept_ids = [tid for tid, keep in zip(chunk_ids, keep_mask.tolist()) if keep]
+    #        # Now remove any ids that are part of the question span (local indices)
+    #        if q_in_chunk_count > 0:
+    #            q_local_mask = torch.zeros(T, dtype=torch.bool, device=device)
+    #            q_local_mask[question_local_start: question_local_start + q_in_chunk_count] = True
+    #            kept_ids = [tid for i, tid in enumerate(chunk_ids) if keep_mask[i].item() and not q_local_mask[i].item()]
+
+    #        # Decode kept prompt-only tokens:
+    #        if len(kept_ids) > 0:
+    #            kept_text_parts.append(self.comp_tok.decode(kept_ids, skip_special_tokens=True))
+
+    #        keep_probs_list.append(keep_probs)
+    #        if sample:
+    #            actions_list.append((keep_mask.to(keep_probs.dtype)))
+    #            log_probs_list.append(log_probs)
+    #            entropies_list.append(entropies)
+
+    #        running += T
+
+    #    kept_text = " ".join([s for s in kept_text_parts if s.strip() != ""]).strip()
+    #    kept_ratio = (total_kept_prompt_tokens / max(1, total_prompt_tokens)) if total_prompt_tokens > 0 else 1.0
+
+    #    return CompressionOutput(
+    #        kept_text=kept_text,
+    #        keep_probs=keep_probs_list,
+    #        actions=actions_list if sample else None,
+    #        log_probs=log_probs_list if sample else None,
+    #        entropies=entropies_list if sample else None,
+    #        kept_ratio=kept_ratio,
+    #        meta=dict(
+    #            total_prompt_tokens=total_prompt_tokens,
+    #            total_kept_prompt_tokens=total_kept_prompt_tokens,
+    #        )
+    #    )
 
     # --------- Decoder-side utilities ---------
 
@@ -361,9 +500,10 @@ class PromptCompressionWrapper(nn.Module):
         dec_input_text = self._format_for_decoder(comp_out.kept_text, question_text)
         enc = self.dec_tok(dec_input_text, return_tensors="pt").to(self.device)
         gen_kwargs = dict(
-            max_new_tokens=256,
-            do_sample=False,
-            temperature=1.0,
+            max_new_tokens=1024,
+            do_sample=True,
+            temperature=0.6,
+            top_p=0.95,
             **gen_kwargs
         )
         outputs = self.decoder.generate(**enc, **gen_kwargs)
