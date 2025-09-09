@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+export HF_HOME=$WORK/hf_cache
+
 # 2) Prepare a JSONL (or JSON) dataset:
 # each line: {"prompt": "...", "question": "...", "answer": "..."}
 
@@ -11,12 +13,24 @@
 #  --save_dir ckpt_compressor_qwen_xlmr \
 #  --epochs 1 --batch_size 2 --lr 5e-6 --lambda_length 0.5 --entropy_beta 1e-3
 
+#python train.py \
+#  --train_path "databricks/databricks-dolly-15k" \
+#  --decoder "Qwen/Qwen3-0.6B" \
+#  --compressor "facebook/xlm-roberta-xl" \
+#  --save_dir "ckpt_compressor_dolly" \
+#  --epochs 1 --batch_size 2 --lr 5e-6 --lambda_length 0.5 --entropy_beta 1e-3
+
 python train.py \
   --train_path "databricks/databricks-dolly-15k" \
   --decoder "Qwen/Qwen3-0.6B" \
   --compressor "facebook/xlm-roberta-xl" \
   --save_dir "ckpt_compressor_dolly" \
-  --epochs 1 --batch_size 2 --lr 5e-6 --lambda_length 0.5 --entropy_beta 1e-3
+  --epochs 1 --batch_size 2 --lr 5e-6 \
+  --lambda_length 0.5 --entropy_beta 1e-3 \
+  --use_wandb --wandb_project prompt-compressor \
+  --wandb_run_name qwen-xlmr-rl \
+  --wandb_tags "qwen3-0.6b,xlm-roberta-xl,reinforce"
+
 
 
 ## 4) Inference (example sketch inside Python):
