@@ -3,3 +3,4 @@ data
 src/tacc/
 src/opt_len_cot/bkup
 src/opt_len_cot/__pycache__
+src/opt_len_cot/wandb
