@@ -135,7 +135,7 @@ def chunk_cot(input_and_cot_tokens, input_and_cot_ids, cot_eot_probs, input_len,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate COT for a dataset")
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen3-8B', choices=['deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B', 'Qwen/Qwen3-8B'])
-    parser.add_argument('--dataset', type=str, required=True, choices=['aime', 'gsm8k', 'math'])
+    parser.add_argument('--dataset', type=str, required=True, choices=['aime', 'gsm8k', 'math', 'hotpotqa'])
     parser.add_argument('--subject', type=str, required=False, choices=['Algebra', 'Prealgebra'], help='Required if `dataset==math`')
     parser.add_argument('--level', type=int, required=False, choices=[1, 2, 3, 4, 5], help='Required if `dataset==math`')
     parser.add_argument('--output_dir', type=str, default='/scratch/saydalie/llm_reasoning/data/outputs/')
@@ -184,7 +184,6 @@ if __name__ == "__main__":
                 input_len=item['input_len'],
                 method=method
             )
-
 
             batch_size = 2  # adjust depending on GPU memory
             num_return_sequences = 3
