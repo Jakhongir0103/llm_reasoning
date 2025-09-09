@@ -3,7 +3,7 @@ import argparse
 import json
 import os
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +11,12 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 
 from model import PromptCompressionWrapper
+
+# --- optional wandb import (safe) ---
+try:
+    import wandb  # type: ignore
+except Exception:
+    wandb = None
 
 
 class PromptQADataset(Dataset):
@@ -65,12 +71,19 @@ def train_one_epoch(
     grad_accum_steps: int = 1,
     max_batches: int = None,
     log_every: int = 50,
-) -> Dict[str, float]:
+    # --- wandb options ---
+    base_step: int = 0,
+    wandb_run: Optional["wandb.sdk.wandb_run.Run"] = None,
+    wandb_log_every: Optional[int] = None,
+) -> Tuple[Dict[str, float], int]:
     """
     REINFORCE objective with:
       reward = -NLL(answer|ctx)  - lambda_length * kept_ratio
-      loss   = - (reward - baseline) * sum(log pi(a_t)) - entropy_beta * H
+      loss   = - (reward - baseline) * mean(log pi(a_t)) - entropy_beta * H
     Only compressor parameters are updated.
+
+    Returns:
+      (epoch_stats_dict, steps_taken)
     """
     device = model.device
     model.train()
@@ -80,6 +93,7 @@ def train_one_epoch(
 
     ema_baseline = 0.0
     step = 0
+    wb_every = wandb_log_every if wandb_log_every is not None else log_every
 
     meters = dict(loss=0.0, reward=0.0, nll=0.0, kept_ratio=0.0, entropy=0.0, count=0)
 
@@ -108,15 +122,14 @@ def train_one_epoch(
 
             # Task reward via frozen decoder NLL (lower CE => higher reward)
             nll, ans_len = model.nll_of_answer(kept_text, question, answer)
-            # normalize by answer length to keep reward scale consistent
+            # NOTE: nll is already the mean CE over answer tokens (decoder labels masking handles this).
             nll = nll.detach()
             reward_task = -nll
 
             # Length penalty encourages short prompts
             reward = reward_task - lambda_length * kept_ratio
 
-            # Sum of log probs over all chunk tokens (only where actions were sampled)
-            # Also collect entropy for regularization
+            # Sum log-probs and entropies; normalize per decision for scale stability
             logp_sum = 0.0
             H_sum = 0.0
             num_decisions = 0
@@ -156,13 +169,25 @@ def train_one_epoch(
             batch_reward_mean = torch.stack(rewards).mean().item()
             ema_baseline = baseline_decay * ema_baseline + (1 - baseline_decay) * batch_reward_mean
 
-        # Logging
+        # Logging (stdout)
         meters["loss"] += loss.item()
         meters["reward"] += torch.stack(rewards).mean().item()
         meters["nll"] += torch.stack(nll_vals).mean().item()
         meters["kept_ratio"] += torch.stack(kept_ratios).mean().item()
         meters["entropy"] += entropy_term.item()
         meters["count"] += 1
+
+        # Logging (wandb)
+        if wandb_run is not None:
+            wb_step = base_step + step + 1
+            wandb_run.log({
+                "train/loss": loss.item(),
+                "train/reward": torch.stack(rewards).mean().item(),
+                "train/nll": torch.stack(nll_vals).mean().item(),
+                "train/kept_ratio": torch.stack(kept_ratios).mean().item(),
+                "train/entropy": entropy_term.item(),
+                "train/baseline": ema_baseline,
+            }, step=wb_step)
 
         if (step + 1) % log_every == 0:
             avg = {k: meters[k] / max(1, meters["count"]) for k in ["loss", "reward", "nll", "kept_ratio", "entropy"]}
@@ -174,8 +199,10 @@ def train_one_epoch(
         step += 1
 
     if meters["count"] == 0:
-        return {}
-    return {k: meters[k] / meters["count"] for k in ["loss", "reward", "nll", "kept_ratio", "entropy"]}
+        return {}, step
+
+    stats = {k: meters[k] / meters["count"] for k in ["loss", "reward", "nll", "kept_ratio", "entropy"]}
+    return stats, step
 
 
 def main():
@@ -196,9 +223,41 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=1)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--max_batches_per_epoch", type=int, default=None)
+
+    # --- wandb flags ---
+    ap.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    ap.add_argument("--wandb_project", type=str, default="prompt-compressor")
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+    ap.add_argument("--wandb_group", type=str, default=None)
+    ap.add_argument("--wandb_tags", type=str, default=None, help="Comma-separated tags, e.g. 'qwen,roberta,rl'")
+    ap.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    ap.add_argument("--wandb_log_every", type=int, default=None, help="Defaults to --log_every inside the loop")
+
     args = ap.parse_args()
 
     set_all_seed(args.seed)
+
+    # Initialize wandb (optional)
+    wb_run = None
+    if args.use_wandb:
+        if wandb is None:
+            print("[wandb] WARNING: --use_wandb set but 'wandb' is not installed. Continuing without logging.")
+        else:
+            if args.wandb_mode == "disabled":
+                os.environ["WANDB_DISABLED"] = "true"
+            else:
+                os.environ.pop("WANDB_DISABLED", None)
+            tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
+            wb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                group=args.wandb_group,
+                tags=tags,
+                mode=args.wandb_mode,
+                config=vars(args),
+            )
 
     # Load the dataset
     dataset = PromptQADataset(args.train_path, max_items=args.max_items)
@@ -222,9 +281,19 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Log parameter counts once
+    if wb_run is not None:
+        total_comp_params = sum(p.numel() for p in model.compressor.parameters())
+        trainable_comp_params = sum(p.numel() for p in model.compressor.parameters() if p.requires_grad)
+        wb_run.log({
+            "params/compressor_total": total_comp_params,
+            "params/compressor_trainable": trainable_comp_params,
+        }, step=0)
+
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
         print(f"\n=== Epoch {epoch} ===")
-        stats = train_one_epoch(
+        stats, steps_taken = train_one_epoch(
             model, loader, optimizer,
             threshold_inference=args.threshold_inference,
             lambda_length=args.lambda_length,
@@ -232,9 +301,18 @@ def main():
             baseline_decay=args.baseline_decay,
             grad_accum_steps=args.grad_accum,
             max_batches=args.max_batches_per_epoch,
+            log_every=50,
+            base_step=global_step,
+            wandb_run=wb_run,
+            wandb_log_every=args.wandb_log_every,
         )
+        global_step += steps_taken
+
         if stats:
             print(f"Epoch {epoch} stats:", {k: round(v, 4) for k, v in stats.items()})
+            if wb_run is not None:
+                wb_run.log({f"epoch/{k}": v for k, v in stats.items()}, step=global_step)
+                wb_run.log({"epoch/number": epoch}, step=global_step)
 
         # Save compressor (just the compressor module for deployment flexibility)
         save_path = os.path.join(args.save_dir, f"epoch_{epoch}")
@@ -244,6 +322,13 @@ def main():
         # Also save the head weights
         torch.save(model.compressor.state_dict(), os.path.join(save_path, "compressor_state.pt"))
         print(f"Saved compressor to {save_path}")
+
+        # Optionally log checkpoint path (no artifact upload by default)
+        if wb_run is not None:
+            wb_run.log({"checkpoint/path": save_path}, step=global_step)
+
+    if wb_run is not None:
+        wb_run.finish()
 
 
 if __name__ == "__main__":
